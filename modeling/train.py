@@ -46,6 +46,7 @@ def train_baseline(
     focal_gamma: float = 2.0,
     focal_alpha: float | None = None,
     use_class_weights: bool = True,
+    cache: bool = True,
 ) -> tf.keras.callbacks.History:
     """Train the baseline MobileNetV2 classifier with a binary head.
 
@@ -77,6 +78,11 @@ def train_baseline(
                        stacking balanced class weights (~8x positive at the real
                        6%-positive distribution) ON TOP of focal alpha is how a
                        model gets pushed into low-precision over-flagging.
+        cache: Keep the preprocessed images in memory across epochs (default
+                       True; the single biggest speedup). Set False when the
+                       cache would not fit RAM -- at 54k train images an
+                       in-memory cache is ~4 bytes * H * W each, so ~14 GB at
+                       224x224 but ~27 GB at 320x320.
 
     Returns:
         Keras History object from model.fit().
@@ -85,8 +91,8 @@ def train_baseline(
     # create a junk local directory for a gs:// path).
     tf.io.gfile.makedirs(checkpoint_dir)
 
-    train_ds = _build_dataset(train_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=True)
-    val_ds = _build_dataset(val_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=False)
+    train_ds = _build_dataset(train_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=True, cache=cache)
+    val_ds = _build_dataset(val_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=False, cache=cache)
 
     model = build_baseline(
         input_size=input_size,
@@ -165,6 +171,7 @@ def train_baseline_two_phase(
     focal_gamma: float = 2.0,
     focal_alpha: float | None = None,
     use_class_weights: bool = True,
+    cache: bool = True,
 ) -> "_CombinedHistory":
     """Two-phase fine-tuning: converge the head frozen, then unfreeze at low LR.
 
@@ -183,8 +190,8 @@ def train_baseline_two_phase(
     both phases so phase 2 continues the objective phase 1 converged on.
     """
     tf.io.gfile.makedirs(checkpoint_dir)
-    train_ds = _build_dataset(train_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=True)
-    val_ds = _build_dataset(val_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=False)
+    train_ds = _build_dataset(train_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=True, cache=cache)
+    val_ds = _build_dataset(val_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=False, cache=cache)
 
     class_weights = _resolve_class_weights(
         train_df[label_col], worth_weight_multiplier, use_class_weights

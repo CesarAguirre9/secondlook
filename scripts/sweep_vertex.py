@@ -3,7 +3,7 @@
 One Vertex job trains + evaluates MANY hyperparameter combinations in a single
 run, so you don't submit (and pay to re-download the dataset for) each combo
 one at a time. The expensive dataset build/download happens ONCE, then every
-config in ``SWEEP_CONFIGS`` is trained against the same in-memory splits.
+config in the selected sweep is trained against the same in-memory splits.
 
 For each config it:
   1. trains the MobileNetV2 baseline with that config's hyperparameters,
@@ -19,9 +19,12 @@ the sweep CONTINUES to the next one — a single bad combo never sinks the whole
 run. The summary CSV is re-uploaded after every config, so a hard crash still
 leaves the results collected so far.
 
->>> EDIT THE SWEEP HERE <<<
-Change ``SWEEP_CONFIGS`` below to whatever grid you want. Each entry is one
-model. Keys per config (all optional except ``name``):
+>>> EDIT THE SWEEPS HERE <<<
+``SWEEPS`` below maps a NAME to a list of configs; pick one at submit time with
+``--sweep NAME``. Keeping past sweeps in the dict (with their results in the
+comment above each) means one staged package serves every job, and concurrent
+jobs cannot race over a single staged tarball. Each entry is one model. Keys
+per config (all optional except ``name``):
     name            : unique label -> checkpoint subdir + summary row id
     mode            : "single" (default) or "two_phase" (see below)
     dropout_rate    : dropout before the head (default 0.3)
@@ -46,6 +49,13 @@ model. Keys per config (all optional except ``name``):
                       never touched, so reported metrics stay honest.
     dataset_fractions : {"rsna": 0.3} — keep this share of that dataset's TRAIN
                       negatives. Applied before max_neg_per_pos.
+    seed            : random seed for model init + shuffling (default 42).
+                      Training is otherwise UNSEEDED-by-default history: config
+                      SEED only ever touched data splitting, which is why the
+                      same recipe scored AUROC 0.810 and 0.837 on identical
+                      splits. Vary it deliberately to measure the noise floor.
+    cache           : keep preprocessed images in RAM between epochs (default
+                      True). Set False only if the cache would not fit.
     input_size      : (H, W) override, e.g. (320, 320). Default 224x224 from
                       config.constants. NOTE: INPUT_SIZE is a "fixed decision"
                       in CLAUDE.md with TF Lite / on-device implications —
@@ -101,74 +111,121 @@ from scripts.train_vertex import (  # noqa: E402
 DEFAULT_CHECKPOINT_DIR = "gs://b2-foundation/second-look/checkpoints/sweep"
 
 
+# Each entry is one NAMED sweep. Pick it at submit time with --sweep NAME, so a
+# single staged package can serve several jobs and two concurrent jobs can never
+# race over one staged tarball.
+SWEEPS: dict[str, list[dict]] = {}
+
+# The two-phase recipe every sweep below builds on (full-gpu-01's winner).
+_TWO_PHASE = {
+    "mode": "two_phase", "phase1_lr": 1e-3, "phase2_lr": 1e-5,
+    "phase1_epochs": 12, "phase2_epochs": 15, "dropout_rate": 0.3,
+}
+
 # ---------------------------------------------------------------------------
-# >>> EDIT THE SWEEP HERE <<<  (see the module docstring for the key meanings)
+# "imbalance" — DONE (full-gpu-02-imbalance, 2026-08-20). Kept for the record.
+# RESULT: every lever LOST to the plain BCE + class-weighting control.
+#   tp_bce_cw 0.674 spec / 0.133 prec | bce_nocw 0.630 / 0.119
+#   focal_g3 0.612 / 0.114 | focal_g2 0.601 / 0.111 | mix10 0.524 / 0.095
+# Loss reweighting moves the boundary but cannot separate classes better, so it
+# could not fix the false-alarm problem. Calibration WAS a big win (ECE ~0.002).
 # ---------------------------------------------------------------------------
-# IMBALANCE SWEEP — FULL COMBINED RUN (shortlist from sweep-imbalance-01).
-#
-# Every config FIXES the winning two-phase recipe (full-gpu-01: AUROC 0.810 vs
-# frozen 0.792) and varies ONLY the imbalance handling, to attack that run's
-# weak point: WORTH precision 0.15-0.19 and ~44% false positives to reach the
-# 0.80 sensitivity floor.
-#
-# WHY THIS SHORTLIST IS REASONED, NOT RANKED. The subset sweep
-# (sweep-imbalance-01, 2026-08-19) ran all 7 candidates successfully but
-# SEPARATED NONE OF THEM: op_specificity spanned 0.975-0.982 across every
-# config, a ~9-image spread on 1,283 test negatives — inside noise. Worse, its
-# test split was 24.6% positive, so its precision (0.91-0.94) cannot estimate
-# precision at the real 5.9%: precision depends on prevalence, so a
-# CBIS-over-weighted subset can never predict it. Compare full-gpu-01's
-# op_specificity 0.556 against the subset's 0.98 for the same recipe.
-#
-# So the subset validated the MACHINERY (7/7 trained, checkpointed, calibrated)
-# and the shortlist below is chosen by MECHANISM. Judge it on op_precision /
-# op_specificity here, where the distribution is finally the real one.
-#
-# COST: full-gpu-01 ran ~3.4h/config, so 5 configs ~= 17h training + the ~178 GB
-# download. The summary CSV is re-uploaded after every config, so a timeout or
-# crash still leaves the completed configs' results in GCS.
-SWEEP_CONFIGS: list[dict] = [
-    # --- Control: the reigning champion, re-run IN THIS JOB so the comparison
-    # is free of run-to-run confounds (same splits, same build, same hardware).
-    # Expect it to reproduce roughly AUROC 0.810 / op_specificity 0.556. ---
-    {"name": "tp_bce_cw", "mode": "two_phase",
-     "phase1_lr": 1e-3, "phase2_lr": 1e-5, "phase1_epochs": 12, "phase2_epochs": 15,
-     "dropout_rate": 0.3, "loss": "bce"},
-
-    # --- The cheapest possible fix, and the most diagnostic: is the class
-    # weighting ITSELF the precision killer? At 5.9% positive, "balanced" is
-    # ~8x on positives and WORTH_WEIGHT_MULTIPLIER puts 1.5x on top of that —
-    # ~12x total pressure toward flagging. This turns it off, changing nothing
-    # else. If it wins, the weak point was self-inflicted. ---
-    {"name": "tp_bce_nocw", "mode": "two_phase",
-     "phase1_lr": 1e-3, "phase2_lr": 1e-5, "phase1_epochs": 12, "phase2_epochs": 15,
-     "dropout_rate": 0.3, "loss": "bce", "use_class_weights": False},
-
-    # --- Focal owning the imbalance alone (class weights OFF), two gammas.
-    # gamma is the focusing strength: higher concentrates more gradient on the
-    # hard boundary cases, which is where precision is won or lost. ---
-    {"name": "tp_focal_g2_a25", "mode": "two_phase",
-     "phase1_lr": 1e-3, "phase2_lr": 1e-5, "phase1_epochs": 12, "phase2_epochs": 15,
-     "dropout_rate": 0.3, "loss": "focal", "focal_gamma": 2.0,
+SWEEPS["imbalance"] = [
+    {"name": "tp_bce_cw", **_TWO_PHASE, "loss": "bce"},
+    {"name": "tp_bce_nocw", **_TWO_PHASE, "loss": "bce", "use_class_weights": False},
+    {"name": "tp_focal_g2_a25", **_TWO_PHASE, "loss": "focal", "focal_gamma": 2.0,
      "focal_alpha": 0.25, "use_class_weights": False},
-    {"name": "tp_focal_g3_a25", "mode": "two_phase",
-     "phase1_lr": 1e-3, "phase2_lr": 1e-5, "phase1_epochs": 12, "phase2_epochs": 15,
-     "dropout_rate": 0.3, "loss": "focal", "focal_gamma": 3.0,
+    {"name": "tp_focal_g3_a25", **_TWO_PHASE, "loss": "focal", "focal_gamma": 3.0,
      "focal_alpha": 0.25, "use_class_weights": False},
-
-    # --- Dataset-mix rebalancing, MEANINGFUL FOR THE FIRST TIME HERE: only at
-    # full scale does RSNA (~38k train images, ~2% positive) actually swamp
-    # CBIS + VinDr. Cap 10 (not the subset's 4) on purpose — 4 would cut RSNA
-    # ~10x and leave a ~50%-positive train set, discarding most of the data.
-    # A boundary shift from rebalancing is harmless by itself (the operating
-    # point is read off the ROC curve at the sensitivity floor, so only the
-    # RANKING matters); the real risk is throwing away information, which is
-    # exactly what the gentler cap hedges. ---
-    {"name": "tp_focal_g2_a25_mix10", "mode": "two_phase",
-     "phase1_lr": 1e-3, "phase2_lr": 1e-5, "phase1_epochs": 12, "phase2_epochs": 15,
-     "dropout_rate": 0.3, "loss": "focal", "focal_gamma": 2.0,
+    {"name": "tp_focal_g2_a25_mix10", **_TWO_PHASE, "loss": "focal", "focal_gamma": 2.0,
      "focal_alpha": 0.25, "use_class_weights": False, "max_neg_per_pos": 10.0},
 ]
+
+# ---------------------------------------------------------------------------
+# "seeds" — MEASURE THE NOISE FLOOR. Three runs of the IDENTICAL champion
+# recipe, differing only by random seed.
+#
+# Why this is worth a whole job: training was never seeded (config.SEED only
+# ever touched data splitting), and the same recipe on the SAME splits scored
+# AUROC 0.810 in full-gpu-01 and 0.837 in full-gpu-02 — a spread WIDER than the
+# gaps between the five imbalance configs. Until we know the noise floor, no
+# single-run comparison in this project can be trusted, including that one.
+#
+# Read the SPREAD, not the winner: the std dev of op_specificity across these
+# three is the smallest difference any future sweep may claim as real.
+# ---------------------------------------------------------------------------
+SWEEPS["seeds"] = [
+    {"name": f"tp_bce_cw_seed{seed}", **_TWO_PHASE, "loss": "bce", "seed": seed}
+    for seed in (42, 1337, 2024)
+]
+
+# ---------------------------------------------------------------------------
+# "resolution" — the top remaining hypothesis. The imbalance sweep showed the
+# problem is not WHERE the boundary sits but that 224x224 may not carry enough
+# signal to separate subtle findings at all (a known ceiling on RSNA).
+#
+# INPUT_SIZE is a "fixed decision" in CLAUDE.md with TF Lite / on-device
+# implications — this run is the evidence for or against changing it, not a
+# change to it. The 224 control is included so the comparison is PAIRED
+# (same job, same splits, same seed) rather than across runs.
+#
+# Memory: the in-memory tf.data cache is ~4 bytes * H * W per image over 54k
+# train + 11k val images => ~17 GB at 224, ~27 GB at 288, ~34 GB at 320. The
+# VM (n1-standard-16) has 60 GB, so 320 is the safe ceiling; 384 (~48 GB) is
+# not attempted. `cache: False` is the escape hatch if one still OOMs, at the
+# cost of re-running CLAHE every epoch.
+# ---------------------------------------------------------------------------
+SWEEPS["resolution"] = [
+    {"name": "tp_bce_cw_res224", **_TWO_PHASE, "loss": "bce", "input_size": (224, 224)},
+    {"name": "tp_bce_cw_res288", **_TWO_PHASE, "loss": "bce", "input_size": (288, 288)},
+    {"name": "tp_bce_cw_res320", **_TWO_PHASE, "loss": "bce", "input_size": (320, 320)},
+]
+
+DEFAULT_SWEEP = "imbalance"
+
+# Every key a config may set. A sweep is validated against this BEFORE the
+# dataset build, because the alternative is discovering a typo ("focal_gama")
+# after it has silently done nothing for a 20-hour GPU job.
+KNOWN_CONFIG_KEYS = {
+    "name", "mode", "dropout_rate", "batch_size", "worth_weight_multiplier",
+    "loss", "focal_gamma", "focal_alpha", "use_class_weights",
+    "max_neg_per_pos", "dataset_fractions", "input_size", "seed", "cache",
+    "freeze_backbone", "learning_rate", "max_epochs",
+    "phase1_lr", "phase2_lr", "phase1_epochs", "phase2_epochs",
+}
+
+
+def validate_sweep(configs: list[dict], sweep_name: str = "<sweep>") -> None:
+    """Fail fast on a malformed sweep: unknown keys, dupe names, bad modes.
+
+    Raises ValueError rather than warning -- an unrecognized key means the run
+    would not test what its author thought it tested, which is worse than not
+    running at all.
+    """
+    if not configs:
+        raise ValueError(f"Sweep '{sweep_name}' is empty.")
+
+    names = [c.get("name") for c in configs]
+    if any(not n for n in names):
+        raise ValueError(f"Sweep '{sweep_name}': every config needs a 'name'.")
+    if len(names) != len(set(names)):
+        raise ValueError(
+            f"Sweep '{sweep_name}': config names must be unique; got {names}."
+        )
+
+    for cfg in configs:
+        unknown = set(cfg) - KNOWN_CONFIG_KEYS
+        if unknown:
+            raise ValueError(
+                f"Sweep '{sweep_name}', config '{cfg.get('name')}': unknown key(s) "
+                f"{sorted(unknown)}. Known keys: {sorted(KNOWN_CONFIG_KEYS)}."
+            )
+        mode = cfg.get("mode", "single")
+        if mode not in ("single", "two_phase"):
+            raise ValueError(
+                f"Sweep '{sweep_name}', config '{cfg.get('name')}': mode must be "
+                f"'single' or 'two_phase'; got '{mode}'."
+            )
 
 
 # Columns collected per config into sweep_summary.csv (ordered for readability:
@@ -177,7 +234,7 @@ SUMMARY_COLUMNS = [
     "name", "status", "mode", "freeze_backbone", "learning_rate", "dropout_rate",
     "worth_weight_multiplier", "batch_size", "max_epochs", "epochs_ran",
     # Imbalance knobs under test.
-    "loss", "focal_gamma", "focal_alpha", "use_class_weights",
+    "loss", "focal_gamma", "focal_alpha", "use_class_weights", "seed", "cache",
     "max_neg_per_pos", "dataset_fractions", "input_size",
     "train_images", "train_positives", "train_pos_rate", "train_mix",
     # Headline metrics.
@@ -197,6 +254,8 @@ def parse_args() -> argparse.Namespace:
         description="Vertex AI hyperparameter sweep: build once -> train/eval each config.",
     )
     # Build phase (mirrors scripts.train_vertex so build_dataset/load_splits work).
+    parser.add_argument("--sweep", default=DEFAULT_SWEEP, choices=sorted(SWEEPS),
+                        help="Which named sweep in SWEEPS to run.")
     parser.add_argument("--datasets", nargs="+", default=["cbis"],
                         help="Datasets to build/train on (e.g. cbis rsna vindr).")
     parser.add_argument("--limit", type=int, default=None,
@@ -323,7 +382,7 @@ def _write_calibration_json(
 def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) -> dict:
     """Train + evaluate a single config. Returns one summary row dict."""
     import tensorflow as tf
-    from config.constants import INPUT_SIZE
+    from config.constants import INPUT_SIZE, SEED
     from modeling.dataset_mix import rebalance_train_mix, train_mix_stats
     from modeling.train import train_baseline, train_baseline_two_phase
     from modeling.evaluate import evaluate_baseline
@@ -342,6 +401,15 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
     max_neg_per_pos = cfg.get("max_neg_per_pos")
     dataset_fractions = cfg.get("dataset_fractions")
     input_size = tuple(cfg.get("input_size", INPUT_SIZE))
+    seed = int(cfg.get("seed", SEED))
+    cache = bool(cfg.get("cache", True))
+
+    # Seed EVERYTHING (python, numpy, tf) before the model is built, so a config
+    # is reproducible and two configs differing only in a knob start from the
+    # same initial weights -- a paired comparison. Training was historically
+    # unseeded, which is why one recipe scored AUROC 0.810 and 0.837 on the same
+    # splits; the "seeds" sweep exists to quantify exactly that.
+    tf.keras.utils.set_random_seed(seed)
 
     row = {
         "name": name, "status": "running", "mode": mode,
@@ -353,6 +421,7 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
         "max_neg_per_pos": max_neg_per_pos,
         "dataset_fractions": str(dataset_fractions) if dataset_fractions else None,
         "input_size": f"{input_size[0]}x{input_size[1]}",
+        "seed": seed, "cache": cache,
     }
 
     # Rebalance the TRAIN mix only. val_df/test_df are deliberately untouched so
@@ -378,7 +447,8 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
                     "max_epochs": f"{p1}+{p2}"})
         print(f"[sweep] CONFIG '{name}' [TWO-PHASE]: p1_lr={p1_lr}({p1}ep) -> "
               f"p2_lr={p2_lr}({p2}ep) dropout={dropout} batch={batch_size} "
-              f"worth_mult={worth_mult}")
+              f"worth_mult={worth_mult} seed={seed} "
+              f"input={input_size[0]}x{input_size[1]} cache={cache}")
         print("#" * 70)
         history = train_baseline_two_phase(
             config_train_df, val_df,
@@ -388,7 +458,7 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
             dropout_rate=dropout, checkpoint_dir=str(local_ckpt_dir),
             worth_weight_multiplier=worth_mult,
             loss=loss, focal_gamma=focal_gamma, focal_alpha=focal_alpha,
-            use_class_weights=use_class_weights,
+            use_class_weights=use_class_weights, cache=cache,
         )
     else:
         freeze = bool(cfg.get("freeze_backbone", True))
@@ -408,7 +478,7 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
             freeze_backbone=freeze, learning_rate=lr, dropout_rate=dropout,
             worth_weight_multiplier=worth_mult,
             loss=loss, focal_gamma=focal_gamma, focal_alpha=focal_alpha,
-            use_class_weights=use_class_weights,
+            use_class_weights=use_class_weights, cache=cache,
         )
     row["epochs_ran"] = len(history.history.get("loss", []))
 
@@ -454,19 +524,18 @@ def run(args: argparse.Namespace) -> None:
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[sweep] {len(SWEEP_CONFIGS)} configs -> {args.checkpoint_dir}")
-    print(f"[sweep] configs: {[c['name'] for c in SWEEP_CONFIGS]}")
+    configs = SWEEPS[args.sweep]
+    # Validate BEFORE the ~178 GB build, so a typo costs seconds not hours.
+    validate_sweep(configs, args.sweep)
+    print(f"[sweep] '{args.sweep}': {len(configs)} configs -> {args.checkpoint_dir}")
+    print(f"[sweep] configs: {[c['name'] for c in configs]}")
 
     # Build the dataset ONCE and reuse the splits across every config.
     manifest_path = build_dataset(args, work_dir)
     train_df, val_df, test_df = load_splits(manifest_path)
 
-    names = [c["name"] for c in SWEEP_CONFIGS]
-    if len(names) != len(set(names)):
-        raise ValueError(f"SWEEP_CONFIGS names must be unique; got {names}")
-
     rows: list[dict] = []
-    for cfg in SWEEP_CONFIGS:
+    for cfg in configs:
         try:
             row = _run_one_config(cfg, args, train_df, val_df, test_df, work_dir)
         except Exception:
