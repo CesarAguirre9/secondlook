@@ -60,6 +60,7 @@ if str(REPO_ROOT) not in sys.path:
 IMAGE_COL = "image_local_path"
 LABEL_COL = "canonical_label"
 SPLIT_COL = "split"
+DATASET_COL = "dataset"
 
 DEFAULT_CHECKPOINT_DIR = "gs://b2-foundation/second-look/checkpoints/baseline"
 
@@ -288,13 +289,36 @@ def run(args: argparse.Namespace) -> None:
     gcs_best = upload_checkpoint(local_ckpt_dir, args.checkpoint_dir)
 
     if args.run_eval and gcs_best is not None:
+        import numpy as np
+        from modeling.baseline_classifier import WORTH_SENSITIVITY_FLOOR
         from modeling.evaluate import evaluate_baseline
+        from modeling.metrics import prevalence_by_dataset, select_threshold_at_floor
+        from modeling.train import _build_dataset
+
         model = tf.keras.models.load_model(str(local_ckpt_dir / "best.keras"))
+
+        # Deploy threshold comes from VAL, never from the test labels.
+        val_ds = _build_dataset(val_df, "", IMAGE_COL, LABEL_COL, INPUT_SIZE,
+                                args.batch_size, shuffle=False)
+        val_probs = model.predict(val_ds, verbose=0).ravel()
+        val_labels = np.asarray([int(y) for y in val_df[LABEL_COL]])
+        val_threshold = select_threshold_at_floor(
+            val_labels, val_probs, WORTH_SENSITIVITY_FLOOR
+        )
+        print(f"[eval] val-selected threshold: {val_threshold}")
+
+        has_dataset = DATASET_COL in test_df.columns
         print("[eval] evaluating best checkpoint on the test split")
         evaluate_baseline(
             model, test_df, image_dir="",
             image_col=IMAGE_COL, label_col=LABEL_COL,
             input_size=INPUT_SIZE, batch_size=args.batch_size,
+            deploy_threshold=val_threshold,
+            dataset_col=DATASET_COL if has_dataset else None,
+            train_prevalence=(
+                prevalence_by_dataset(train_df, DATASET_COL, LABEL_COL)
+                if has_dataset else None
+            ),
         )
 
     print("[done] training entrypoint complete.")

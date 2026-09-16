@@ -9,8 +9,9 @@ For each config it:
   1. trains the MobileNetV2 baseline with that config's hyperparameters,
   2. uploads the best checkpoint to ``<checkpoint-dir>/<config-name>/best.keras``
      (each config keeps its OWN checkpoint — nothing is overwritten),
-  3. evaluates on the held-out test split (AUROC, macro-F1, operating point,
-     calibration), and
+  3. evaluates on the held-out test split: AUROC, macro-F1, the DEPLOY point
+     (threshold chosen on VAL, applied to test), per-dataset metrics, the
+     dataset-prior shortcut AUROC, and calibration, and
   4. appends a row to ``<checkpoint-dir>/sweep_summary.csv`` so you can rank
      configs at a glance.
 
@@ -62,6 +63,15 @@ per config (all optional except ``name``):
                       changing it is a deliberate act, not a free knob, and the
                       in-memory tf.data cache grows with the square of it.
 
+  ARCHITECTURE / SELECTION keys:
+    input_adapter   : "rescale_repeat" (default: [0,1] -> [-1,1], gray repeated
+                      to 3ch, matching MobileNetV2 pretraining) or "conv1x1"
+                      (legacy random 1x1 conv used by every run before
+                      modeling_Cesar). See baseline_classifier.INPUT_ADAPTERS.
+    monitor         : checkpoint/early-stop metric: "val_auc" (default) or
+                      "val_spec_at_sens" (specificity at the 0.80 floor, the
+                      deploy objective).
+
   mode="single" (one-shot) keys:
     freeze_backbone : True keeps MobileNetV2 frozen (head-only); False fine-tunes
     learning_rate   : Adam LR. ~1e-3 for frozen; ~1e-4/1e-5 if fine-tuning
@@ -98,6 +108,7 @@ if str(REPO_ROOT) not in sys.path:
 # baseline share one code path (build, split loading, checkpoint upload, the
 # GCS debug-log capture). Only the multi-config loop is new.
 from scripts.train_vertex import (  # noqa: E402
+    DATASET_COL,
     IMAGE_COL,
     LABEL_COL,
     _Tee,
@@ -181,6 +192,30 @@ SWEEPS["resolution"] = [
     {"name": "tp_bce_cw_res320", **_TWO_PHASE, "loss": "bce", "input_size": (320, 320)},
 ]
 
+# ---------------------------------------------------------------------------
+# "input_fixes" — PAIRED test of the modeling_Cesar changes (same job, splits,
+# and seed), on the champion two-phase BCE recipe:
+#   legacy     : the old random bias-free 1x1 conv input + val_auc selection.
+#                Reproduces pre-branch behavior (apart from quality-failed
+#                train images now being dropped instead of zero-filled).
+#   rescale    : [-1, 1] rescale + channel repeat (what MobileNetV2 was
+#                pretrained on). Expected to be the largest single gain.
+#   rescale_specmon : rescale + checkpoint selection on specificity at the
+#                sensitivity floor instead of AUROC.
+#
+# Read deploy_specificity / deploy_precision (VAL-selected threshold) and the
+# per_dataset column, not the oracle op_* columns. Differences smaller than
+# the spread measured by the "seeds" sweep are not real.
+# ---------------------------------------------------------------------------
+SWEEPS["input_fixes"] = [
+    {"name": "tp_bce_cw_legacy", **_TWO_PHASE, "loss": "bce",
+     "input_adapter": "conv1x1", "monitor": "val_auc"},
+    {"name": "tp_bce_cw_rescale", **_TWO_PHASE, "loss": "bce",
+     "input_adapter": "rescale_repeat", "monitor": "val_auc"},
+    {"name": "tp_bce_cw_rescale_specmon", **_TWO_PHASE, "loss": "bce",
+     "input_adapter": "rescale_repeat", "monitor": "val_spec_at_sens"},
+]
+
 DEFAULT_SWEEP = "imbalance"
 
 # Every key a config may set. A sweep is validated against this BEFORE the
@@ -190,6 +225,7 @@ KNOWN_CONFIG_KEYS = {
     "name", "mode", "dropout_rate", "batch_size", "worth_weight_multiplier",
     "loss", "focal_gamma", "focal_alpha", "use_class_weights",
     "max_neg_per_pos", "dataset_fractions", "input_size", "seed", "cache",
+    "input_adapter", "monitor",
     "freeze_backbone", "learning_rate", "max_epochs",
     "phase1_lr", "phase2_lr", "phase1_epochs", "phase2_epochs",
 }
@@ -220,6 +256,18 @@ def validate_sweep(configs: list[dict], sweep_name: str = "<sweep>") -> None:
                 f"Sweep '{sweep_name}', config '{cfg.get('name')}': unknown key(s) "
                 f"{sorted(unknown)}. Known keys: {sorted(KNOWN_CONFIG_KEYS)}."
             )
+        adapter = cfg.get("input_adapter", "rescale_repeat")
+        if adapter not in ("rescale_repeat", "conv1x1"):
+            raise ValueError(
+                f"Sweep '{sweep_name}', config '{cfg.get('name')}': input_adapter "
+                f"must be 'rescale_repeat' or 'conv1x1'; got '{adapter}'."
+            )
+        monitor = cfg.get("monitor", "val_auc")
+        if monitor not in ("val_auc", "val_spec_at_sens"):
+            raise ValueError(
+                f"Sweep '{sweep_name}', config '{cfg.get('name')}': monitor must "
+                f"be 'val_auc' or 'val_spec_at_sens'; got '{monitor}'."
+            )
         mode = cfg.get("mode", "single")
         if mode not in ("single", "two_phase"):
             raise ValueError(
@@ -236,11 +284,20 @@ SUMMARY_COLUMNS = [
     # Imbalance knobs under test.
     "loss", "focal_gamma", "focal_alpha", "use_class_weights", "seed", "cache",
     "max_neg_per_pos", "dataset_fractions", "input_size",
+    "input_adapter", "monitor",
     "train_images", "train_positives", "train_pos_rate", "train_mix",
     # Headline metrics.
     "auroc", "macro_f1", "worth_sensitivity", "passed_floor",
-    # The operating point at the 0.80 floor — op_precision and op_specificity
-    # are THE columns this sweep is trying to move.
+    # DEPLOY point: threshold selected on VAL at the 0.80 floor, applied to
+    # test. These are the honest columns to rank on; deploy_sensitivity CAN fall
+    # below the floor, and deploy_passed_floor says whether it did.
+    "val_threshold", "deploy_sensitivity", "deploy_specificity",
+    "deploy_precision", "deploy_worth_f1", "deploy_passed_floor",
+    # Shortcut check: pooled AUROC from dataset identity alone, and the metrics
+    # computed within each dataset (which that shortcut cannot inflate).
+    "dataset_prior_auroc", "per_dataset",
+    # ORACLE point (threshold tuned on test; optimistic). Kept so this summary
+    # stays comparable with sweeps run before modeling_Cesar.
     "op_threshold", "op_sensitivity", "op_specificity", "op_precision",
     "op_worth_f1",
     # Calibration, before and after temperature scaling fitted on val.
@@ -298,8 +355,20 @@ def _upload_summary(rows: list[dict], checkpoint_dir: str, work_dir: Path) -> No
         print(f"[sweep] could not upload summary: {exc}")
 
 
+def _predict_split(model, df, batch_size: int, input_size):
+    """Run inference over a split once; returns (labels, probabilities)."""
+    import numpy as np
+
+    from modeling.train import _build_dataset
+
+    ds = _build_dataset(df, "", IMAGE_COL, LABEL_COL, input_size, batch_size, shuffle=False)
+    probs = model.predict(ds, verbose=0).ravel()
+    labels = np.asarray([int(y) for y in df[LABEL_COL]])
+    return labels, probs
+
+
 def _calibrate(
-    model, val_df, eval_result: dict, batch_size: int, input_size, gcs_config_dir: str
+    val_labels, val_probs, eval_result: dict, gcs_config_dir: str
 ) -> dict:
     """Fit temperature scaling on VAL, report its effect on the TEST ECE.
 
@@ -311,22 +380,13 @@ def _calibrate(
     Failures here are caught and recorded: a calibration problem must not throw
     away a config's trained checkpoint and its real metrics.
     """
-    import numpy as np  # heavy imports stay inside functions (see module note)
-
     from modeling.calibrate import (
         apply_temperature,
         expected_calibration_error,
         fit_temperature,
     )
-    from modeling.train import _build_dataset
 
     try:
-        val_ds = _build_dataset(
-            val_df, "", IMAGE_COL, LABEL_COL, input_size, batch_size, shuffle=False
-        )
-        val_probs = model.predict(val_ds, verbose=0).ravel()
-        val_labels = np.asarray([int(y) for y in val_df[LABEL_COL]])
-
         temperature = fit_temperature(val_labels, val_probs)
 
         test_probs = eval_result["probabilities"]
@@ -385,7 +445,13 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
     from config.constants import INPUT_SIZE, SEED
     from modeling.dataset_mix import rebalance_train_mix, train_mix_stats
     from modeling.train import train_baseline, train_baseline_two_phase
+    from modeling.baseline_classifier import WORTH_SENSITIVITY_FLOOR
     from modeling.evaluate import evaluate_baseline
+    from modeling.metrics import (
+        format_per_dataset,
+        prevalence_by_dataset,
+        select_threshold_at_floor,
+    )
 
     name = cfg["name"]
     mode = cfg.get("mode", "single")
@@ -403,6 +469,8 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
     input_size = tuple(cfg.get("input_size", INPUT_SIZE))
     seed = int(cfg.get("seed", SEED))
     cache = bool(cfg.get("cache", True))
+    input_adapter = str(cfg.get("input_adapter", "rescale_repeat"))
+    monitor = str(cfg.get("monitor", "val_auc"))
 
     # Seed EVERYTHING (python, numpy, tf) before the model is built, so a config
     # is reproducible and two configs differing only in a knob start from the
@@ -422,6 +490,7 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
         "dataset_fractions": str(dataset_fractions) if dataset_fractions else None,
         "input_size": f"{input_size[0]}x{input_size[1]}",
         "seed": seed, "cache": cache,
+        "input_adapter": input_adapter, "monitor": monitor,
     }
 
     # Rebalance the TRAIN mix only. val_df/test_df are deliberately untouched so
@@ -448,7 +517,8 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
         print(f"[sweep] CONFIG '{name}' [TWO-PHASE]: p1_lr={p1_lr}({p1}ep) -> "
               f"p2_lr={p2_lr}({p2}ep) dropout={dropout} batch={batch_size} "
               f"worth_mult={worth_mult} seed={seed} "
-              f"input={input_size[0]}x{input_size[1]} cache={cache}")
+              f"input={input_size[0]}x{input_size[1]} cache={cache} "
+              f"adapter={input_adapter} monitor={monitor}")
         print("#" * 70)
         history = train_baseline_two_phase(
             config_train_df, val_df,
@@ -459,6 +529,7 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
             worth_weight_multiplier=worth_mult,
             loss=loss, focal_gamma=focal_gamma, focal_alpha=focal_alpha,
             use_class_weights=use_class_weights, cache=cache,
+            input_adapter=input_adapter, monitor=monitor,
         )
     else:
         freeze = bool(cfg.get("freeze_backbone", True))
@@ -468,7 +539,7 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
                     "max_epochs": max_epochs})
         print(f"[sweep] CONFIG '{name}' [SINGLE]: freeze={freeze} lr={lr} "
               f"dropout={dropout} batch={batch_size} max_epochs={max_epochs} "
-              f"worth_mult={worth_mult}")
+              f"worth_mult={worth_mult} adapter={input_adapter} monitor={monitor}")
         print("#" * 70)
         history = train_baseline(
             config_train_df, val_df,
@@ -479,6 +550,7 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
             worth_weight_multiplier=worth_mult,
             loss=loss, focal_gamma=focal_gamma, focal_alpha=focal_alpha,
             use_class_weights=use_class_weights, cache=cache,
+            input_adapter=input_adapter, monitor=monitor,
         )
     row["epochs_ran"] = len(history.history.get("loss", []))
 
@@ -487,12 +559,42 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
 
     if gcs_best is not None:
         model = tf.keras.models.load_model(str(local_ckpt_dir / "best.keras"))
+
+        # Choose the deploy threshold on VAL, before test is ever looked at.
+        # The same val predictions feed temperature scaling below.
+        val_labels, val_probs = _predict_split(model, val_df, batch_size, input_size)
+        val_threshold = select_threshold_at_floor(
+            val_labels, val_probs, WORTH_SENSITIVITY_FLOOR
+        )
+        print(f"[sweep] val-selected threshold at the "
+              f"{WORTH_SENSITIVITY_FLOOR:.2f} floor: {val_threshold}")
+
+        has_dataset = DATASET_COL in test_df.columns
         print(f"[sweep] evaluating '{name}' on the test split")
         res = evaluate_baseline(
             model, test_df, image_dir="", image_col=IMAGE_COL, label_col=LABEL_COL,
             input_size=input_size, batch_size=batch_size, output_dir=gcs_config_dir,
+            deploy_threshold=val_threshold,
+            dataset_col=DATASET_COL if has_dataset else None,
+            train_prevalence=(
+                prevalence_by_dataset(config_train_df, DATASET_COL, LABEL_COL)
+                if has_dataset else None
+            ),
         )
         op = res.get("operating_point") or {}
+        deploy = res.get("deploy_point") or {}
+        row.update({
+            "val_threshold": val_threshold,
+            "deploy_sensitivity": deploy.get("sensitivity"),
+            "deploy_specificity": deploy.get("specificity"),
+            "deploy_precision": deploy.get("precision"),
+            "deploy_worth_f1": deploy.get("worth_f1"),
+            "deploy_passed_floor": res.get("deploy_passed_floor"),
+            "dataset_prior_auroc": res.get("dataset_prior_auroc"),
+            "per_dataset": (
+                format_per_dataset(res["per_dataset"]) if res.get("per_dataset") else None
+            ),
+        })
         row.update({
             "auroc": res.get("auroc"),
             "macro_f1": res.get("macro_f1"),
@@ -506,9 +608,7 @@ def _run_one_config(cfg: dict, args, train_df, val_df, test_df, work_dir: Path) 
             "brier": res.get("brier_score"),
             "ece": res.get("ece"),
         })
-        row.update(
-            _calibrate(model, val_df, res, batch_size, input_size, gcs_config_dir)
-        )
+        row.update(_calibrate(val_labels, val_probs, res, gcs_config_dir))
         del model
     else:
         print(f"[sweep] '{name}' produced no checkpoint; skipping eval")
@@ -541,39 +641,45 @@ def run(args: argparse.Namespace) -> None:
         except Exception:
             tb = traceback.format_exc()
             print(f"[sweep] CONFIG '{cfg.get('name')}' FAILED:\n{tb}")
-            row = {
-                "name": cfg.get("name"), "status": "failed",
-                "freeze_backbone": cfg.get("freeze_backbone"),
-                "learning_rate": cfg.get("learning_rate"),
-                "dropout_rate": cfg.get("dropout_rate"),
+            # Keep every knob the config set, so a failed row still says WHAT
+            # failed (only keys that are summary columns survive reindexing).
+            row = {k: (str(v) if isinstance(v, (dict, list, tuple)) else v)
+                   for k, v in cfg.items()}
+            row.update({
+                "status": "failed",
                 "error": tb.strip().splitlines()[-1] if tb.strip() else "unknown",
-            }
+            })
         rows.append(row)
         _upload_summary(rows, args.checkpoint_dir, work_dir)  # incremental durability
 
     print("\n[sweep] all configs done. Summary:")
     ok = [r for r in rows if r.get("status") == "ok"]
 
-    # Ranked by SPECIFICITY AT THE SENSITIVITY FLOOR, not AUROC. The floor is
-    # already met by construction at that operating point, so among configs that
-    # are equally safe, the better one is the one that raises fewer false
-    # alarms. AUROC barely moves under loss reweighting (it reranks nothing), so
-    # ranking on it would hide exactly the effect this sweep is measuring.
+    # Ranked on the DEPLOY point (threshold chosen on val, applied to test):
+    # configs whose test sensitivity actually held the floor come first, then
+    # by specificity (fewer false alarms). The old ranking used the oracle
+    # op_specificity, whose threshold was tuned on test, so the floor was "met"
+    # by construction and could never flag an unsafe config.
     def _key(r):
-        spec = r.get("op_specificity")
-        return (spec is None, -(spec or 0.0))
+        spec = r.get("deploy_specificity")
+        return (r.get("deploy_passed_floor") is not True, spec is None, -(spec or 0.0))
 
-    print(f"  {'config':24s} {'AUROC':>6s} {'macroF1':>8s} {'spec@floor':>11s} "
-          f"{'prec@floor':>11s} {'sens':>6s} {'ECE':>6s} {'ECEcal':>7s}")
+    print(f"  {'config':28s} {'AUROC':>6s} {'prior':>6s} {'sens':>6s} {'floor':>5s} "
+          f"{'spec':>6s} {'prec':>6s} {'oracleSpec':>10s} {'ECEcal':>7s}")
     for r in sorted(ok, key=_key):
         def _f(key, width=6, nd=3):
             v = r.get(key)
             return f"{v:>{width}.{nd}f}" if isinstance(v, (int, float)) else f"{'n/a':>{width}s}"
-        print(f"  {r['name']:24s} {_f('auroc')} {_f('macro_f1', 8)} "
-              f"{_f('op_specificity', 11)} {_f('op_precision', 11)} "
-              f"{_f('op_sensitivity')} {_f('ece')} {_f('ece_calibrated', 7)}")
-    print("  (ranked by specificity at the 0.80 WORTH-sensitivity floor; "
-          "the floor is met by construction at that operating point)")
+        floor = {True: "PASS", False: "FAIL"}.get(r.get("deploy_passed_floor"), "n/a")
+        print(f"  {r['name']:28s} {_f('auroc')} {_f('dataset_prior_auroc')} "
+              f"{_f('deploy_sensitivity')} {floor:>5s} {_f('deploy_specificity')} "
+              f"{_f('deploy_precision')} {_f('op_specificity', 10)} "
+              f"{_f('ece_calibrated', 7)}")
+        if r.get("per_dataset"):
+            print(f"      per-dataset: {r['per_dataset']}")
+    print("  (deploy point = threshold chosen on VAL at the 0.80 WORTH-sensitivity "
+          "floor, applied to test; ranked floor-passing first, then by specificity. "
+          "'prior' = AUROC from dataset identity alone.)")
     failed = [r["name"] for r in rows if r.get("status") == "failed"]
     if failed:
         print(f"[sweep] FAILED configs: {failed}")

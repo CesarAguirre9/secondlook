@@ -20,12 +20,22 @@ import pandas as pd
 
 from config.constants import INPUT_SIZE
 from modeling.baseline_classifier import (
+    DEFAULT_INPUT_ADAPTER,
+    WORTH_SENSITIVITY_FLOOR,
     build_baseline,
     compute_class_weights,
 )
 from modeling.losses import build_loss, describe_loss
 from data_pipeline.preprocessor import preprocess
 from data_pipeline.quality import quality_check
+
+# Metrics a run may select checkpoints / early-stop on (both maximized).
+#   "val_auc" (default): threshold-independent; matches every past sweep.
+#   "val_spec_at_sens": specificity at WORTH sensitivity = WORTH_SENSITIVITY_FLOOR,
+#       i.e. the deploy objective itself. AUROC averages over the whole ROC curve,
+#       most of which (sensitivity < 0.80) we would never operate in.
+SUPPORTED_MONITORS = ("val_auc", "val_spec_at_sens")
+DEFAULT_MONITOR = "val_auc"
 
 
 def train_baseline(
@@ -47,6 +57,8 @@ def train_baseline(
     focal_alpha: float | None = None,
     use_class_weights: bool = True,
     cache: bool = True,
+    input_adapter: str = DEFAULT_INPUT_ADAPTER,
+    monitor: str = DEFAULT_MONITOR,
 ) -> tf.keras.callbacks.History:
     """Train the baseline MobileNetV2 classifier with a binary head.
 
@@ -83,21 +95,27 @@ def train_baseline(
                        cache would not fit RAM -- at 54k train images an
                        in-memory cache is ~4 bytes * H * W each, so ~14 GB at
                        224x224 but ~27 GB at 320x320.
+        input_adapter: How grayscale input reaches the backbone; see
+                       modeling.baseline_classifier.INPUT_ADAPTERS.
+        monitor: Metric for checkpoint selection + early stopping, one of
+                       SUPPORTED_MONITORS.
 
     Returns:
         Keras History object from model.fit().
     """
+    _check_monitor(monitor)
     # gfile.makedirs handles both local paths and gs:// URIs (os.makedirs would
     # create a junk local directory for a gs:// path).
     tf.io.gfile.makedirs(checkpoint_dir)
 
-    train_ds = _build_dataset(train_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=True, cache=cache)
+    train_ds = _build_dataset(train_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=True, cache=cache, drop_failed_quality=True)
     val_ds = _build_dataset(val_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=False, cache=cache)
 
     model = build_baseline(
         input_size=input_size,
         freeze_backbone=freeze_backbone,
         dropout_rate=dropout_rate,
+        input_adapter=input_adapter,
     )
     print(f"[train] loss: {describe_loss(loss, focal_gamma, focal_alpha, use_class_weights)}")
     _compile(model, learning_rate, loss, focal_gamma, focal_alpha)
@@ -106,7 +124,7 @@ def train_baseline(
         train_df[label_col], worth_weight_multiplier, use_class_weights
     )
 
-    callbacks = _build_callbacks(checkpoint_dir)
+    callbacks = _build_callbacks(checkpoint_dir, monitor=monitor)
 
     history = model.fit(
         train_ds,
@@ -172,6 +190,8 @@ def train_baseline_two_phase(
     focal_alpha: float | None = None,
     use_class_weights: bool = True,
     cache: bool = True,
+    input_adapter: str = DEFAULT_INPUT_ADAPTER,
+    monitor: str = DEFAULT_MONITOR,
 ) -> "_CombinedHistory":
     """Two-phase fine-tuning: converge the head frozen, then unfreeze at low LR.
 
@@ -183,14 +203,17 @@ def train_baseline_two_phase(
     warm-starting the head first, and not perturbing BN statistics, avoids that.
 
     ``best.keras`` under ``checkpoint_dir`` holds the best PHASE-2 model by
-    val_auc. Returns a combined history spanning both phases.
+    ``monitor`` (val_auc by default). Returns a combined history spanning both phases.
 
     ``loss`` / ``focal_gamma`` / ``focal_alpha`` / ``use_class_weights`` are the
     imbalance knobs documented on ``train_baseline``; the SAME loss is used in
     both phases so phase 2 continues the objective phase 1 converged on.
+    ``input_adapter`` / ``monitor`` are documented there too; ``monitor`` drives
+    both phases' early stopping and the phase-2 checkpoint.
     """
+    _check_monitor(monitor)
     tf.io.gfile.makedirs(checkpoint_dir)
-    train_ds = _build_dataset(train_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=True, cache=cache)
+    train_ds = _build_dataset(train_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=True, cache=cache, drop_failed_quality=True)
     val_ds = _build_dataset(val_df, image_dir, image_col, label_col, input_size, batch_size, shuffle=False, cache=cache)
 
     class_weights = _resolve_class_weights(
@@ -201,7 +224,8 @@ def train_baseline_two_phase(
     # Build frozen: build_baseline(freeze_backbone=True) calls the backbone with
     # training=False, baking BatchNorm into inference mode for BOTH phases.
     model = build_baseline(
-        input_size=input_size, freeze_backbone=True, dropout_rate=dropout_rate
+        input_size=input_size, freeze_backbone=True, dropout_rate=dropout_rate,
+        input_adapter=input_adapter,
     )
 
     # --- Phase 1: head only (backbone frozen) ---
@@ -210,7 +234,7 @@ def train_baseline_two_phase(
     _compile(model, phase1_lr, loss, focal_gamma, focal_alpha)
     phase1_callbacks = [
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_auc", mode="max", patience=5,
+            monitor=monitor, mode="max", patience=5,
             restore_best_weights=True, verbose=1,
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
@@ -236,7 +260,7 @@ def train_baseline_two_phase(
           f"lr={phase2_lr} (BatchNorm layers kept frozen: {frozen_bn})")
     # Recompile so the trainable-flag changes take effect, at the LOW phase-2 LR.
     _compile(model, phase2_lr, loss, focal_gamma, focal_alpha)
-    phase2_callbacks = _build_callbacks(checkpoint_dir)  # best.keras by val_auc
+    phase2_callbacks = _build_callbacks(checkpoint_dir, monitor=monitor)  # best.keras by monitor
     h2 = model.fit(
         train_ds, validation_data=val_ds, epochs=phase2_epochs,
         class_weight=class_weights, callbacks=phase2_callbacks,
@@ -263,11 +287,27 @@ def _compile(
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
         loss=build_loss(loss, focal_gamma=focal_gamma, focal_alpha=focal_alpha),
-        # val_auc is what ModelCheckpoint/EarlyStopping monitor -- it must stay
-        # in this list. AUC is also the one metric that is comparable ACROSS
-        # losses, which matters when a sweep mixes bce and focal configs.
-        metrics=["accuracy", tf.keras.metrics.AUC(name="auc")],
+        # Every SUPPORTED_MONITORS entry must be produced here, since
+        # ModelCheckpoint/EarlyStopping watch them. AUC is also the one metric
+        # that is comparable ACROSS losses (bce vs focal); spec_at_sens is the
+        # deploy objective, and is likewise loss-independent.
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.SpecificityAtSensitivity(
+                WORTH_SENSITIVITY_FLOOR, name="spec_at_sens"
+            ),
+        ],
     )
+
+
+def _check_monitor(monitor: str) -> None:
+    """Unknown monitors must fail before any data loads: Keras only WARNS when
+    a monitored metric is missing, and the run would silently never checkpoint."""
+    if monitor not in SUPPORTED_MONITORS:
+        raise ValueError(
+            f"Unknown monitor '{monitor}'. Expected one of {SUPPORTED_MONITORS}."
+        )
 
 
 def _resolve_class_weights(
@@ -304,7 +344,16 @@ def _build_dataset(
     batch_size: int,
     shuffle: bool,
     cache: bool = True,
+    drop_failed_quality: bool = False,
 ) -> tf.data.Dataset:
+    """Build a batched tf.data pipeline over a split.
+
+    drop_failed_quality: remove images that fail data_pipeline.quality_check
+        instead of feeding a zero image. Use for TRAINING only. A zero image
+        still carries its real label, so it is pure label noise (a blank frame
+        labelled WORTH teaches nothing but confusion). Evaluation must keep it
+        False: evaluate.py aligns predictions with test_df row-by-row.
+    """
     paths = [os.path.join(image_dir, p) for p in df[image_col]]
     labels = [int(y) for y in df[label_col]]
 
@@ -318,6 +367,10 @@ def _build_dataset(
         lambda path, label: _load_and_preprocess(path, label, input_size),
         num_parallel_calls=tf.data.AUTOTUNE,
     )
+    # Filter BEFORE the cache so rejected images are decided (and logged) once.
+    if drop_failed_quality:
+        ds = ds.filter(lambda image, label, passed: passed)
+    ds = ds.map(lambda image, label, passed: (image, label))
     # Cache BEFORE shuffle so every epoch still reshuffles (caching after a
     # shuffle would freeze a single order). In-memory cache: ~200 KB/image, so a
     # ~55k-image split is ~11 GB — fits the training VM's RAM.
@@ -335,33 +388,39 @@ def _load_and_preprocess(
     path: tf.Tensor,
     label: tf.Tensor,
     input_size: tuple,
-) -> tuple[tf.Tensor, tf.Tensor]:
-    """Load an image from disk and run the preprocessing pipeline."""
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    """Load an image and preprocess it. Returns (image, label, passed_quality)."""
     raw = tf.io.read_file(path)
     image = tf.image.decode_png(raw, channels=1)
 
     # Run numpy-side preprocessing (CLAHE, masking, orientation) via py_function.
     # This is acceptable for training; TF Lite inference uses the C++ pipeline.
-    image = tf.py_function(
-        func=lambda img: _numpy_preprocess(img.numpy(), input_size),
-        inp=[image],
-        Tout=tf.float32,
+    image, passed = tf.py_function(
+        func=lambda img, p: _numpy_preprocess(img.numpy(), input_size, p.numpy()),
+        inp=[image, path],
+        Tout=[tf.float32, tf.bool],
     )
     image.set_shape((*input_size, 1))
+    passed.set_shape(())
     # Binary head expects float32 labels.
     label = tf.cast(label, tf.float32)
-    return image, label
+    return image, label, passed
 
 
-def _numpy_preprocess(image_np: np.ndarray, input_size: tuple) -> np.ndarray:
-    """Bridge from tf.py_function to the data_pipeline preprocessor."""
+def _numpy_preprocess(
+    image_np: np.ndarray, input_size: tuple, path: bytes | str = b""
+) -> tuple[np.ndarray, bool]:
+    """Bridge from tf.py_function to the data_pipeline preprocessor.
+
+    Returns (image, passed_quality). A failing image comes back as zeros so
+    evaluation keeps row alignment; training filters it out (see _build_dataset).
+    """
     passes, reason = quality_check(image_np)
     if not passes:
-        # Return a zero image for bad-quality samples during training.
-        # These will be filtered in production; during training they contribute
-        # zero signal (not noise) and their presence can be audited via reason.
-        return np.zeros((*input_size, 1), dtype=np.float32)
-    return preprocess(image_np, target_size=input_size)
+        name = path.decode("utf-8", "replace") if isinstance(path, bytes) else path
+        print(f"[quality] rejected {name}: {reason}")
+        return np.zeros((*input_size, 1), dtype=np.float32), False
+    return preprocess(image_np, target_size=input_size), True
 
 
 # ---------------------------------------------------------------------------
@@ -378,21 +437,26 @@ def _checkpoint_path(checkpoint_dir: str, filename: str) -> str:
     return os.path.join(checkpoint_dir, filename)
 
 
-def _build_callbacks(checkpoint_dir: str, filename: str = "best.keras") -> list:
+def _build_callbacks(
+    checkpoint_dir: str,
+    filename: str = "best.keras",
+    monitor: str = DEFAULT_MONITOR,
+) -> list:
+    _check_monitor(monitor)
     return [
         tf.keras.callbacks.ModelCheckpoint(
             filepath=_checkpoint_path(checkpoint_dir, filename),
-            monitor="val_auc",
+            monitor=monitor,
             mode="max",
             save_best_only=True,
             verbose=1,
         ),
-        # Monitor the same metric as ModelCheckpoint (val_auc) so the weights
-        # restored in memory match the best.keras written to disk. Mixing
-        # val_loss here with val_auc above would let the saved checkpoint and
-        # the returned model come from different epochs.
+        # Monitor the same metric as ModelCheckpoint so the weights restored in
+        # memory match the best.keras written to disk. Mixing metrics here
+        # would let the saved checkpoint and the returned model come from
+        # different epochs.
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_auc",
+            monitor=monitor,
             mode="max",
             patience=7,
             restore_best_weights=True,

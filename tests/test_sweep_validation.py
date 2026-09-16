@@ -47,6 +47,18 @@ def test_rejects_bad_mode():
         validate_sweep([{"name": "x", "mode": "twophase"}], "s")
 
 
+def test_rejects_bad_input_adapter():
+    with pytest.raises(ValueError, match="input_adapter"):
+        validate_sweep([{"name": "x", "input_adapter": "rescale"}], "s")
+
+
+def test_rejects_bad_monitor():
+    # Keras only warns on a missing monitor metric and then never checkpoints;
+    # the sweep must refuse it up front.
+    with pytest.raises(ValueError, match="monitor"):
+        validate_sweep([{"name": "x", "monitor": "val_spec"}], "s")
+
+
 def test_rejects_empty_sweep():
     with pytest.raises(ValueError, match="empty"):
         validate_sweep([], "s")
@@ -66,5 +78,5 @@ def test_known_keys_cover_the_trainer_arguments():
     # If someone adds a trainer argument but forgets KNOWN_CONFIG_KEYS, configs
     # using it would be rejected. Keep the two in sync.
     for key in ("loss", "focal_gamma", "focal_alpha", "use_class_weights",
-                "cache", "seed", "input_size"):
+                "cache", "seed", "input_size", "input_adapter", "monitor"):
         assert key in KNOWN_CONFIG_KEYS

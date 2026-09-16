@@ -5,8 +5,8 @@
 # simple — one backbone, one head, no fusion.
 
 # Architecture:
-#   Input (H, W, 1) grayscale
-#     → 1x1 Conv projection to 3 channels  (TF Lite safe; avoids Lambda layers)
+#   Input (H, W, 1) grayscale in [0, 1]
+#     → input adapter → (H, W, 3) in [-1, 1]  (see INPUT_ADAPTERS below)
 #     → MobileNetV2 backbone (frozen initially)
 #     → GlobalAveragePooling
 #     → Dropout
@@ -41,11 +41,29 @@ WORTH_SENSITIVITY_FLOOR = 0.80
 # Reflects the asymmetric cost of a missed WORTH case vs. a false alarm.
 WORTH_WEIGHT_MULTIPLIER = 1.5
 
+# How the 1-channel [0, 1] preprocessor output is turned into the 3-channel
+# input the ImageNet-pretrained backbone expects.
+#
+#   "rescale_repeat" (default): Rescaling to [-1, 1], then the same channel
+#       three times. MobileNetV2's pretrained weights were trained on inputs in
+#       [-1, 1] (keras.applications.mobilenet_v2.preprocess_input), and the
+#       backbone does NOT apply that scaling itself. Rescaling + Concatenate are
+#       plain mul/add/concat ops, so the model stays TF Lite safe.
+#   "conv1x1" (legacy, every run before modeling_Cesar): a randomly initialized,
+#       bias-free 1x1 conv. Without a bias it can scale [0, 1] but never shift it
+#       into [-1, 1], and a random init can invert channels, so the pretrained
+#       features never see the input distribution they were trained on. Kept
+#       ONLY so a sweep can run a paired comparison against past results.
+INPUT_ADAPTERS = ("rescale_repeat", "conv1x1")
+DEFAULT_INPUT_ADAPTER = "rescale_repeat"
+
 
 def build_baseline(
     input_size: tuple = INPUT_SIZE,
     dropout_rate: float = 0.3,
     freeze_backbone: bool = True,
+    input_adapter: str = DEFAULT_INPUT_ADAPTER,
+    weights: str | None = "imagenet",
 ) -> tf.keras.Model:
     """Build the baseline MobileNetV2 classifier with a binary head.
 
@@ -55,27 +73,45 @@ def build_baseline(
         freeze_backbone: If True, MobileNetV2 weights are frozen during initial
                          training. Set to False for fine-tuning after the head
                          has converged.
+        input_adapter: One of INPUT_ADAPTERS. Default "rescale_repeat"; "conv1x1"
+                       reproduces the legacy architecture for paired comparisons.
+        weights: Backbone initialization, passed to MobileNetV2 ("imagenet" or
+                       None). None exists for offline unit tests only.
 
     Returns:
         Compiled-ready Keras Model with a sigmoid head — pair with
         binary_crossentropy in train.py.
+
+    Raises:
+        ValueError: If ``input_adapter`` is unknown (never silently fall back).
     """
+    if input_adapter not in INPUT_ADAPTERS:
+        raise ValueError(
+            f"Unknown input_adapter '{input_adapter}'. Expected one of {INPUT_ADAPTERS}."
+        )
+
     inputs = tf.keras.Input(shape=(*input_size, 1), name="mammogram_input")
 
-    # 1x1 conv projects grayscale → 3 channels so MobileNetV2 pretrained
-    # weights apply. TF Lite safe (no Lambda/tf.repeat).
-    x = layers.Conv2D(
-        filters=3,
-        kernel_size=(1, 1),
-        padding="same",
-        use_bias=False,
-        name="channel_expand",
-    )(inputs)
+    if input_adapter == "rescale_repeat":
+        # [0, 1] -> [-1, 1], MobileNetV2's pretraining range, then gray -> 3ch.
+        # TF Lite safe (no Lambda/tf.repeat).
+        scaled = layers.Rescaling(2.0, offset=-1.0, name="to_imagenet_range")(inputs)
+        x = layers.Concatenate(axis=-1, name="channel_expand")([scaled, scaled, scaled])
+    else:
+        # Legacy: random bias-free 1x1 conv. See INPUT_ADAPTERS for why this is
+        # a poor match for the pretrained backbone.
+        x = layers.Conv2D(
+            filters=3,
+            kernel_size=(1, 1),
+            padding="same",
+            use_bias=False,
+            name="channel_expand",
+        )(inputs)
 
     backbone = tf.keras.applications.MobileNetV2(
         input_shape=(*input_size, 3),
         include_top=False,
-        weights="imagenet",
+        weights=weights,
     )
     backbone.trainable = not freeze_backbone
 

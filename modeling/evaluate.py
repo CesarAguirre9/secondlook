@@ -8,13 +8,20 @@
 #   1. AUROC — the honest, threshold-INDEPENDENT discrimination metric. On
 #      imbalanced data (CBIS is ~87% positive) raw accuracy/sensitivity at a
 #      fixed 0.5 threshold are misleading; AUROC is not.
-#   2. Operating point at the sensitivity floor — instead of a hard-coded 0.5,
-#      pick the threshold that MAXIMIZES specificity subject to WORTH
-#      sensitivity >= WORTH_SENSITIVITY_FLOOR (0.80). This is the operating
-#      point we would actually deploy, per the failure-mode hierarchy. Reported
-#      with PRECISION and WORTH-F1 at that same point: on a ~94%-negative
-#      screening set, specificity flatters the false-alarm burden and precision
-#      does not (0.56 specificity at 6% prevalence = most flags are wrong).
+#   2. DEPLOY point — the threshold that maximizes specificity subject to WORTH
+#      sensitivity >= WORTH_SENSITIVITY_FLOOR (0.80), SELECTED ON VALIDATION
+#      (pass ``deploy_threshold``) and then applied unchanged to test. Test
+#      sensitivity at that threshold can land below the floor; that is the
+#      honest safety check. Reported with PRECISION and WORTH-F1: on a
+#      ~94%-negative screening set, specificity flatters the false-alarm burden
+#      and precision does not.
+#      The older test-selected "oracle" point (operating_point) is still
+#      reported for continuity with past sweeps, but it is optimistic by
+#      construction: its threshold was tuned on the labels it is scored on.
+#   2b. PER-DATASET metrics + the dataset-prior AUROC shortcut baseline (pass
+#      ``dataset_col`` / ``train_prevalence``). Pooled AUROC across CBIS/RSNA/
+#      VinDr can be earned by recognizing the source dataset; see
+#      modeling.metrics.
 #   3. Calibration — Brier score, Expected Calibration Error, and an optional
 #      reliability diagram. Needed before confidence can drive the UX tiers.
 #
@@ -33,10 +40,8 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
-    precision_score,
     recall_score,
     roc_auc_score,
-    roc_curve,
 )
 
 from config.constants import INPUT_SIZE
@@ -46,6 +51,12 @@ from modeling.baseline_classifier import (
     WORTH_SENSITIVITY_FLOOR,
 )
 from modeling.calibrate import CALIBRATION_BINS, calibration_curve
+from modeling.metrics import (
+    dataset_prior_auroc,
+    metrics_at_threshold,
+    per_dataset_metrics,
+    select_threshold_at_floor,
+)
 from modeling.train import _build_dataset
 
 
@@ -61,6 +72,9 @@ def evaluate_baseline(
     raise_on_unsafe: bool = False,
     sensitivity_floor: float = WORTH_SENSITIVITY_FLOOR,
     output_dir: str | None = None,
+    deploy_threshold: float | None = None,
+    dataset_col: str | None = None,
+    train_prevalence: dict[str, float] | None = None,
 ) -> dict:
     """Evaluate the baseline model on the test set (sensitivity-first protocol).
 
@@ -89,12 +103,22 @@ def evaluate_baseline(
         sensitivity_floor: Minimum acceptable WORTH sensitivity (default 0.80).
         output_dir: If given, write a reliability-diagram PNG here. Accepts a
                     local path or a gs:// URI (written via tf.io.gfile).
+        deploy_threshold: Threshold selected on the VALIDATION split (see
+                    modeling.metrics.select_threshold_at_floor). When given, the
+                    honest deploy_point metrics are computed on test at exactly
+                    this threshold. None skips them (the oracle point remains).
+        dataset_col: Column in test_df naming the source dataset. When given,
+                    per-dataset metrics are reported.
+        train_prevalence: {dataset: TRAIN positive rate}. With dataset_col,
+                    reports the dataset-prior AUROC shortcut baseline.
 
     Returns:
         Dict with keys: per_class_sensitivity, confusion_matrix, report_str,
         worth_sensitivity, passed_safety_floor, threshold, auroc, macro_f1,
-        per_class_f1, operating_point (threshold/sensitivity/specificity/
-        precision/worth_f1), brier_score, ece, reliability_diagram_path, and the
+        per_class_f1, operating_point (TEST-selected oracle: threshold/
+        sensitivity/specificity/precision/worth_f1), deploy_point (VAL-selected
+        threshold applied to test, or None), deploy_passed_floor, per_dataset,
+        dataset_prior_auroc, brier_score, ece, reliability_diagram_path, and the
         raw probabilities + true_labels arrays.
     """
     if isinstance(model, str):
@@ -139,6 +163,24 @@ def evaluate_baseline(
     operating_point = _operating_point_at_floor(
         true_labels, probabilities, sensitivity_floor
     )
+    deploy_point = None
+    deploy_passed = None
+    if deploy_threshold is not None:
+        deploy_point = metrics_at_threshold(true_labels, probabilities, deploy_threshold)
+        deploy_passed = (
+            deploy_point["sensitivity"] is not None
+            and deploy_point["sensitivity"] >= sensitivity_floor
+        )
+
+    per_dataset = None
+    prior_auroc = None
+    if dataset_col is not None:
+        datasets = test_df[dataset_col].astype(str).to_numpy()
+        per_dataset = per_dataset_metrics(
+            true_labels, probabilities, datasets, deploy_threshold
+        )
+        if train_prevalence is not None:
+            prior_auroc = dataset_prior_auroc(true_labels, datasets, train_prevalence)
     brier, ece, curve = calibration_curve(
         true_labels, probabilities, n_bins=CALIBRATION_BINS
     )
@@ -149,6 +191,7 @@ def evaluate_baseline(
     _print_results(
         per_class_sensitivity, worth_sensitivity, cm, report, threshold,
         auroc, operating_point, brier, ece, sensitivity_floor, macro_f1,
+        deploy_point, per_dataset, prior_auroc,
     )
 
     passed = worth_sensitivity >= sensitivity_floor
@@ -176,6 +219,10 @@ def evaluate_baseline(
         "macro_f1": macro_f1,
         "per_class_f1": {LABEL_ORDER[i]: float(f) for i, f in enumerate(per_class_f1)},
         "operating_point": operating_point,
+        "deploy_point": deploy_point,
+        "deploy_passed_floor": deploy_passed,
+        "per_dataset": per_dataset,
+        "dataset_prior_auroc": prior_auroc,
         "brier_score": brier,
         "ece": ece,
         "reliability_diagram_path": diagram_path,
@@ -212,49 +259,24 @@ def _operating_point_at_floor(
     probabilities: np.ndarray,
     sensitivity_floor: float,
 ) -> dict | None:
-    """Pick the threshold with max specificity s.t. WORTH sensitivity >= floor.
+    """TEST-selected ("oracle") threshold with max specificity at the floor.
 
-    Walks the ROC curve (thresholds descending, sensitivity non-decreasing) and
-    takes the FIRST point that clears the floor — that point has the smallest
-    false-positive rate (highest specificity) among all points that satisfy the
-    sensitivity requirement. This is the deployable operating point per the
-    failure-mode hierarchy: meet the sensitivity floor first, then minimize
-    false alarms. Returns None if no threshold meets the floor (or single-class).
+    OPTIMISTIC BY CONSTRUCTION: the threshold is tuned on the same labels it is
+    scored on, so the floor is always met. Kept only so new runs stay comparable
+    with earlier sweep summaries -- read deploy_point for the honest number.
+    Returns None if no threshold meets the floor (or single-class).
     """
-    if not _both_classes_present(true_labels):
+    thr = select_threshold_at_floor(true_labels, probabilities, sensitivity_floor)
+    if thr is None:
+        if _both_classes_present(true_labels):
+            print(
+                f"\nNOTE: no threshold reaches the {sensitivity_floor:.2f} "
+                f"sensitivity floor on this test set; no safe operating point exists."
+            )
         return None
-
-    fpr, tpr, thresholds = roc_curve(true_labels, probabilities)
-    meets = tpr >= sensitivity_floor
-    if not meets.any():
-        print(
-            f"\nNOTE: no threshold reaches the {sensitivity_floor:.2f} "
-            f"sensitivity floor on this test set; no safe operating point exists."
-        )
-        return None
-
-    idx = int(np.argmax(meets))  # first index where sensitivity clears the floor
-    thr = float(thresholds[idx])
-    # sklearn prepends an infinite threshold; clamp to 1.0 for a usable value.
-    if not np.isfinite(thr):
-        thr = 1.0
-
-    # Precision and F1 on WORTH at this exact operating point. Specificity alone
-    # hides how bad the false-alarm burden really is on a ~94%-negative set: at
-    # 6% prevalence, 0.56 specificity means most flags are wrong. Precision is
-    # the number that says so directly, so it belongs in the operating point.
-    at_op = (probabilities >= thr).astype(np.int64)
-    precision = float(
-        precision_score(true_labels, at_op, pos_label=1, zero_division=0)
-    )
-    worth_f1 = float(f1_score(true_labels, at_op, pos_label=1, zero_division=0))
-    return {
-        "threshold": thr,
-        "sensitivity": float(tpr[idx]),
-        "specificity": float(1.0 - fpr[idx]),
-        "precision": precision,
-        "worth_f1": worth_f1,
-    }
+    m = metrics_at_threshold(true_labels, probabilities, thr)
+    return {k: m[k] for k in
+            ("threshold", "sensitivity", "specificity", "precision", "worth_f1")}
 
 
 def _save_reliability_diagram(
@@ -314,6 +336,9 @@ def _print_results(
     ece: float,
     sensitivity_floor: float,
     macro_f1: float,
+    deploy_point: dict | None = None,
+    per_dataset: dict | None = None,
+    prior_auroc: float | None = None,
 ) -> None:
     print("\n" + "=" * 60)
     print("SECOND LOOK - BASELINE EVALUATION")
@@ -325,8 +350,37 @@ def _print_results(
     # Imbalance-robust headline alongside AUROC. Guards against a majority-class
     # collapse that accuracy would otherwise flatter.
     print(f"Macro-F1 (imbalance-robust)  : {macro_f1:.3f}")
+    if prior_auroc is not None:
+        # The shortcut baseline: AUROC from dataset identity alone, no pixels.
+        print(f"Dataset-prior AUROC (no-pixel shortcut baseline): {prior_auroc:.3f}")
 
-    print("\nDeployable operating point (max specificity at the sensitivity floor):")
+    def _fmt(v):
+        return "n/a" if v is None else f"{v:.3f}"
+
+    print("\nDEPLOY point (threshold selected on VAL, applied to test):")
+    if deploy_point is None:
+        print("  not computed - no val-selected threshold was supplied.")
+    else:
+        sens = deploy_point["sensitivity"]
+        verdict = "PASS" if sens is not None and sens >= sensitivity_floor else "FAIL"
+        print(f"  threshold  : {deploy_point['threshold']:.3f}")
+        print(f"  sensitivity: {_fmt(sens)} (WORTH; floor {sensitivity_floor:.2f}) "
+              f"-> {verdict}")
+        print(f"  specificity: {_fmt(deploy_point['specificity'])}")
+        print(f"  precision  : {_fmt(deploy_point['precision'])}")
+        print(f"  WORTH F1   : {_fmt(deploy_point['worth_f1'])}")
+
+    if per_dataset:
+        print("\nPer-dataset (dataset identity cannot inflate these):")
+        print(f"  {'dataset':10s} {'n':>7s} {'pos':>6s} {'AUROC':>6s} "
+              f"{'sens':>6s} {'spec':>6s} {'prec':>6s}")
+        for name, m in per_dataset.items():
+            print(f"  {name:10s} {m['n']:>7d} {m['positives']:>6d} "
+                  f"{_fmt(m['auroc']):>6s} {_fmt(m.get('sensitivity')):>6s} "
+                  f"{_fmt(m.get('specificity')):>6s} {_fmt(m.get('precision')):>6s}")
+
+    print("\nORACLE operating point (threshold tuned ON TEST - optimistic, "
+          "kept for comparison with earlier sweeps):")
     if operating_point is None:
         # ASCII only: this repo has already been bitten by a UnicodeEncodeError
         # on Windows cp1252 consoles. Keep every print in this file ASCII.
