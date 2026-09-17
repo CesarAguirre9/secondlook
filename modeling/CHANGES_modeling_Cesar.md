@@ -35,7 +35,7 @@ Branched from `modeling-hassan`. These changes fix how models are evaluated and 
 - Added `tests/test_metrics.py`, which needs no TensorFlow.
 - Added `tests/test_model_input.py`, which checks the input adapter, the monitor metrics and quality filtering. `build_baseline(weights=None)` lets it run offline.
 - Extended `tests/test_sweep_validation.py` with checks for the new settings.
-- **Status:** all changed files compile, but the tests have **not been run yet**. The local 64-bit TensorFlow environment was still installing.
+- **Status:** the full suite passes on TF 2.17 / Python 3.10 (95 passed, 2 skipped because the image fixtures aren't present). Running the tests exposed a bug: sklearn's `roc_curve` prunes ROC points by default, which could return a lower threshold than the highest one meeting the floor. It now uses `drop_intermediate=False`.
 
 ## Caveats
 - `rescale_repeat` is now the default. Results from the `seeds` or `resolution` sweeps run from this branch are not directly comparable with full-gpu-01/02; use `input_fixes` for that comparison.

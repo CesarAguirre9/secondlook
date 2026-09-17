@@ -49,7 +49,9 @@ def select_threshold_at_floor(
     if not _both_classes_present(labels):
         return None
 
-    fpr, tpr, thresholds = roc_curve(labels, probabilities)
+    # drop_intermediate=False: the default prunes collinear ROC points, which can
+    # skip the highest qualifying threshold and return a lower one at the same FPR.
+    fpr, tpr, thresholds = roc_curve(labels, probabilities, drop_intermediate=False)
     meets = tpr >= sensitivity_floor
     if not meets.any():
         return None
